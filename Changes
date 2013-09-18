@@ -1,0 +1,4 @@
+Revision history for Perl extension WWW::Salesforce.
+0.01 Sep 18 2013
+    - initial release with large portions shamelessly stolen from NetSuite.pm found on github
+
