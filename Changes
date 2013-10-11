@@ -1,4 +1,9 @@
-Revision history for Perl extension WWW::Salesforce.
-0.01 Sep 18 2013
+Revision history for Perl extension WebService::NetSuite.
+
+0.02 2013-10-11
+    - add company id parameter to cart url to speed up redirects
+    - RT 88790, updated changes file to conform to CPAN::Changes::Spec
+
+0.01 2013-09-18
     - initial release with large portions shamelessly stolen from NetSuite.pm found on github
 

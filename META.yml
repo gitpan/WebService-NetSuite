@@ -24,4 +24,4 @@ requires:
   SOAP::Lite: 1.05
   XML::Parser: 0
   XML::Parser::EasyTree: 0
-version: 0.01
+version: 0.02

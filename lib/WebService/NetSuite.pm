@@ -16,14 +16,17 @@ use Encode;
 
 use WebService::NetSuite::Config;
 
-our $VERSION = '0.01';
+our $VERSION = '0.02';
 
 our $version        = "2013_1";
 our $sandbox_nshost = "https://webservices.sandbox.netsuite.com";
 our $prod_nshost    = "https://webservices.netsuite.com";
 
 our $sso_href  = 'https://%s/app/site/backend/sitesso.nl';
-our $cart_href = 'https://%s/app/site/backend/additemtocart.nl';
+our $cart_href = 'http://%s/app/site/backend/additemtocart.nl';
+
+our $sandbox_shopping = 'shopping.sandbox.netsuite.com';
+our $prod_shopping    = 'shopping.netsuite.com';
 
 our $sandbox_checkout = 'checkout.sandbox.netsuite.com';
 our $prod_checkout    = 'checkout.netsuite.com';
@@ -89,7 +92,7 @@ has 'cart_href' => (
     default  => sub {
         my $self = shift;
         my $href = sprintf( $cart_href,
-            ( $self->sandbox == 1 ) ? $sandbox_checkout : $prod_checkout );
+            ( $self->sandbox == 1 ) ? $sandbox_shopping : $prod_shopping );
         return $href;
     }
 );
@@ -606,10 +609,12 @@ sub cart_url {
     my $buy_id    = $args->{buy_id} || die 'no buy_id';
     my $show_cart = $args->{show_cart};
     my $quantity  = $args->{quantity} || 1;
+    my $c         = $args->{c} || die 'no company id';
 
     my %args = (
         buyid => $buy_id,
         qty   => $quantity,
+        c     => $c,
     );
 
     $args{showcart} = $show_cart if $show_cart;
