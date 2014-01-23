@@ -2,11 +2,14 @@ package WebService::NetSuite;
 
 use strict;
 use warnings;
-
 use Moose;
 use Carp;
-use SOAP::Lite;    # ( +trace => 'all' );
+use LWP;
+use LWP::UserAgent;
+use LWP::Debug;
+use SOAP::Lite;
 use Data::Dumper;
+use JSON;
 use XML::Parser;
 use XML::Parser::EasyTree;
 $XML::Parser::EasyTree::Noempty = 1;
@@ -16,106 +19,244 @@ use Encode;
 
 use WebService::NetSuite::Config;
 
-our $VERSION = '0.02';
+our $ME = 'WebService::NetSuite';
+our $VERSION = '0.03';
 
-our $version        = "2013_1";
-our $sandbox_nshost = "https://webservices.sandbox.netsuite.com";
-our $prod_nshost    = "https://webservices.netsuite.com";
+our $nsversion = "2013_2";
 
-our $sso_href  = 'https://%s/app/site/backend/sitesso.nl';
-our $cart_href = 'http://%s/app/site/backend/additemtocart.nl';
+our $soap_href = "https://webservices.%s/services/NetSuitePort_$nsversion";
+our $sso_href  = 'https://checkout.%s/app/site/backend/sitesso.nl';
+our $cart_href = 'http://shopping.%s/app/site/backend/additemtocart.nl';
 
-our $sandbox_shopping = 'shopping.sandbox.netsuite.com';
-our $prod_shopping    = 'shopping.netsuite.com';
+our $debug            = 0; # global setting for deb(), trigger on pkg variable
+our $debugFile        = 'NetSuite.dbg';
 
-our $sandbox_checkout = 'checkout.sandbox.netsuite.com';
-our $prod_checkout    = 'checkout.netsuite.com';
+# defined as globals so these don't appear when printing Dumper($self):
+our $record_namespaces = &WebService::NetSuite::Config::RecordNamespaces;
+our $search_namespaces = &WebService::NetSuite::Config::SearchNamespaces;
+our $record_types      = &WebService::NetSuite::Config::RecordTypes;
+our $search_types      = &WebService::NetSuite::Config::SearchTypes;
+our $record_fields     = &WebService::NetSuite::Config::RecordFields;
 
-has 'time'            => ( is => 'rw', required => 0 );
-has 'company'         => ( is => 'ro', required => 0 );
-has 'rsa_private_key' => ( is => 'ro', required => 0 );
+has 'debug'           => ( is => 'rw', trigger => \&setDebug );
+has 'debugfile'       => ( is => 'rw', trigger => \&setDebugFile,
+                           default => 'NetSuite.dbg' );
+has 'time'            => ( is => 'rw' );
+has 'company'         => ( is => 'ro' );
+has 'rsa_private_key' => ( is => 'ro' );
 has 'nsemail'         => ( is => 'ro', required => 1 );
 has 'nspassword'      => ( is => 'ro', required => 1 );
-has 'nsrole'          => ( is => 'ro', required => 0, default => 3 );
-has 'nsaccount'       => ( is => 'ro', required => 1 );
-has 'sandbox'         => ( is => 'ro', required => 0, default => 1 );
-has 'site_id'         => ( is => 'ro', required => 0, default => 1 );
+has 'nsrole'          => ( is => 'ro', writer   => '_set_nsrole' );
+has 'nsaccount'       => ( is => 'ro', writer   => '_set_nsaccount' );
+has 'nsroleName'      => ( is => 'ro', writer   => '_set_nsroleName' );
+has 'nsaccountName'   => ( is => 'ro', writer   => '_set_nsaccountName' );
+has 'nsdomain'        => ( is => 'ro',
+                           writer       => '_set_nsdomain',
+                           default      => 'netsuite.com' );
+has 'sandbox'         => ( is           => 'ro',
+                           default      => 0,
+                           writer       => '_set_sandbox',
+                           trigger      => \&setSandbox );
+has 'site_id'         => ( is           => 'ro',
+                           default      => 1 );
 
-has 'record_namespaces' => (
-    is       => 'ro',
-    required => 1,
-    default  => \&WebService::NetSuite::Config::RecordNamespaces
+has 'sso_href'        => (is            => 'ro',
+                          required      => 1,
+                          lazy          => 1,
+                          default       => sub {
+                              my $self = shift;
+                              my $href = sprintf( $sso_href, $self->nsdomain);
+                              return $href;
+                          }
 );
 
-has 'search_namespaces' => (
-    is       => 'ro',
-    required => 1,
-    default  => \&WebService::NetSuite::Config::SearchNamespaces
+has 'cart_href'       => (is            => 'ro',
+                          required      => 1,
+                          lazy          => 1,
+                          default       => sub {
+                              my $self = shift;
+                              my $href = sprintf($cart_href, self->nsdomain);
+                              return $href;
+                          }
 );
 
-has 'record_types' => (
-    is       => 'ro',
-    required => 1,
-    default  => \&WebService::NetSuite::Config::RecordTypes
-);
+has 'soap' => (is => 'ro', writer => '_set_soap');
 
-has 'search_types' => (
-    is       => 'ro',
-    required => 1,
-    default  => \&WebService::NetSuite::Config::SearchTypes
-);
+sub setDebug {
+    my $self = shift;
+    $debug = $self->debug;
+}
 
-has 'record_fields' => (
-    is       => 'ro',
-    required => 1,
-    default  => \&WebService::NetSuite::Config::RecordFields
-);
+sub setDebugfile {
+    my $self = shift;
+    $debugFile = $self->debugfile;
+}
 
-has 'sso_href' => (
-    is       => 'ro',
-    required => 1,
-    lazy     => 1,
-    default  => sub {
-        my $self = shift;
-        my $href = sprintf( $sso_href,
-            ( $self->sandbox == 1 )
-            ? $sandbox_checkout
-            : $prod_checkout );
-        return $href;
+sub setSandbox {
+    my $self = shift;
+    my $domain = $self->nsdomain;
+    $domain =~ s/sandbox\.//;
+    if ($self->sandbox) {
+        $domain = 'sandbox.' . $domain;
     }
-);
+    $self->_set_nsdomain($domain);
+}
 
-has 'cart_href' => (
-    is       => 'ro',
-    required => 1,
-    lazy     => 1,
-    default  => sub {
-        my $self = shift;
-        my $href = sprintf( $cart_href,
-            ( $self->sandbox == 1 ) ? $sandbox_shopping : $prod_shopping );
-        return $href;
+sub nvl {
+    my ($v1,$v2) =  @_;
+    return defined($v1) ? $v1 : $v2;
+}
+
+sub deb {
+    my ($msg) = @_;
+    if ($debug) {
+        open LOG, ">>NetSuite.dbg";
+        print LOG $msg;
+        close LOG;
     }
-);
+}
 
-has 'soap' => (
-    is       => 'ro',
-    required => 1,
-    lazy     => 1,
-    default  => sub {
-        my $self = shift;
-        my $nshost = ( $self->sandbox == 1 ) ? $sandbox_nshost : $prod_nshost;
+# debf takes format like printf
+sub debf {
+    my $fmt = shift;
+    deb sprintf($fmt, @_);
+}
 
-        my $soap = SOAP::Lite->new;
-        $soap->proxy("$nshost/services/NetSuitePort_$version");
+sub fatal {
+    my ($msg) = @_;
+    my ($package, $filename, $line, $sub, $hasargs,
+        $wantarray, $evaltext, $is_require, $hints, $bitmask, $hinthash)
+         = caller(1);
+    $sub =~ s/::BUILD/->new/ || $sub =~ s/::([^:]*)/->$1/;
+    deb   "FATAL ERROR IN $sub: $msg";
+    croak "FATAL ERROR IN $sub: $msg";
+}
 
-        my $systemNamespaces = &WebService::NetSuite::Config::SystemNamespaces;
-        for my $mapping ( keys %{$systemNamespaces} ) {
-            $soap->serializer->register_ns( $systemNamespaces->{$mapping},
-                $mapping );
+sub logMessage {
+  my ($in) = @_;
+  if (!defined($in)) {return;}
+#  if ($in->class() eq "HTTP::Request") {
+#    # do something...
+#    deb $in->contents;
+#  } elsif (class($in) eq "HTTP::Response") {
+#    deb $in->contents;
+#  } else {
+#    deb Dumper(@_);
+#  }
+    deb $in;
+}
+
+sub BUILD { # sub new (this is the constructor)
+    my $self = shift;
+    my $hash = shift;
+
+    if ($debug) { unlink "NetSuite.dbg"; }
+
+    if (exists $hash->{nsaccount} && exists $hash->{nsaccountName}) {
+        fatal "nsaccount and nsaccountName are mutually exclusive options\n";
+    }
+
+    if (exists $hash->{nsrole} && exists $hash->{nsroleName}) {
+        fatal "nsrole and nsroleName are mutually exclusive options\n";
+    }
+
+    if (exists $hash->{nsdomain} && exists $hash->{sandbox}) {
+        fatal "nsdomain and sandbox are mutually exclusive options\n";
+    }
+
+    if (defined($self->nsroleName) && defined($self->nsaccountName)) {
+            $self->getAccountInfo;
+    }
+
+    if ((!defined $self->nsrole) || (!defined $self->nsaccount)
+            || (!defined $self->nsdomain)) {
+        fatal "One of the following combinations must be set:
+1) nsroleName, nsaccountName
+    -or-
+2) nsrole (role id), nsaccount (account id), and nsdomain (netsuite host beginning with https://)";
+    }
+
+    if ($debug) { SOAP::Lite->import(+trace => [debug => \&logMessage ]); }
+    $self->_set_soap(SOAP::Lite->new(readable => 1));
+    my $url = sprintf $soap_href, $self->nsdomain;
+    deb "url=$url\n";
+    $self->soap->proxy($url);
+
+    my $systemNamespaces = &WebService::NetSuite::Config::SystemNamespaces;
+    for my $mapping ( keys %{$systemNamespaces} ) {
+        $self->soap->serializer->register_ns( $systemNamespaces->{$mapping},
+            $mapping );
+    }
+}
+
+sub getAccountInfo {
+    my $self = shift;
+
+    my $host        = 'rest.netsuite.com';
+    my $url         = "https://$host/rest/roles";
+    my $domain      = "$host:443";
+    my $username    = $self->nsemail;
+    my $password    = $self->nspassword;
+    my $role        = $self->nsroleName;
+    my $instance    = $self->nsaccountName;
+    my $roleId      = $self->nsrole;
+    my $accountId   = $self->nsaccount;
+
+    my $wsUrl = '';
+
+    my @ua_args = (keep_alive => 1);
+    my @credentials = ("$host:80", '', $username, $password);
+    my $ua = LWP::UserAgent->new(@ua_args);
+    $ua->credentials(@credentials);
+    #my $request = new HTTP::Request("GET", $url);
+    #my $response = $ua->request($request);
+
+    my $req = new HTTP::Request GET => $url;
+    $req->authorization_basic($username, $password);
+    $req->header('Authorization' => "NLAuth nlauth_email=$username,nlauth_signature=$password");
+    $req->content_type('application/json');
+    #$req->content($content);
+    my $res = $ua->request($req);
+    my $json;
+    if ($res->is_success) {
+        #deb($res->content."\n");
+        $json = decode_json($res->content);
+        deb Dumper($json)."\n";
+        #deb($json->{'Status'}."\n");
+    } else {
+        deb($res->status_line, "\n");
+        return; # error occurred - exit
+    }
+
+    #deb(@{$json}."\n");
+    deb "looking for instance=$instance, role=$role\n\n";
+    debf "%-25s %-30s %s\n", 'Account', 'Role', 'URL';
+    debf "%-25s %-30s %s\n", '-------', '----', '---';
+    my $x;
+    for($x = 0; $x < @{$json}; $x++) {
+        my $a = $json->[$x]->{'account'}->{'name'};
+        my $r = $json->[$x]->{'role'}->{'name'};
+        my $u = $json->[$x]->{'dataCenterURLs'}->{'webservicesDomain'};
+        debf "%-25s %-30s %s\n", $a, $r, $u;
+        if ($a eq $instance && $r eq $role) {
+            deb 'Matched!\n';
+            $wsUrl = $u;
+            last; # break out of for loop
         }
-        return $soap;
     }
-);
+    if ($wsUrl eq '') {
+        fatal "Could not find instance/role - aborting\n";
+    }
+
+    $wsUrl =~ s/https:\/\/webservices\.//;
+    $self->_set_nsdomain($wsUrl);
+    $self->_set_nsrole($json->[$x]->{'role'}->{'internalId'});
+    $self->_set_nsaccount($json->[$x]->{'account'}->{'internalId'});
+    $self->_set_nsroleName($json->[$x]->{'role'}->{'name'});
+    $self->_set_nsaccountName($json->[$x]->{'account'}->{'name'});
+    #my $endpoint = $wsUrl . "/wsdl/v2013_2_0/netsuite.wsdl";
+    deb 'self right after getAccountInfo:\n' . Dumper($self);
+}
 
 sub getRequest {
     my $self = shift;
@@ -136,6 +277,16 @@ sub getHead {
     my $self = shift;
     return $self->{LAST_HEAD};
 }
+
+# return full namespace for core, messages, common (all are in .platform)
+sub namespace {
+    my ($ns) = @_;
+    return $ns . '_' . $nsversion . '.platform';
+}
+
+#
+# Web Services Operations
+#
 
 sub getSelectValue {
     my ( $self, $recordType ) = @_;
@@ -167,7 +318,6 @@ sub getSelectValue {
         }
         else { $self->error; }
     }
-
 }
 
 sub getCustomization {
@@ -203,7 +353,6 @@ sub getCustomization {
         }
         else { $self->error; }
     }
-
 }
 
 sub get {
@@ -216,9 +365,9 @@ sub get {
             {
                 'internalId' => $recordInternalId,
                 'type'       => $recordType,
-                'xsi:type'   => 'core:RecordRef'
+                'xsi:type'   => namespace('core') . ':RecordRef'
             }
-        )->prefix('messages')
+        )->prefix(namespace('messages'))
     );
 
     if ( $som->fault ) { $self->error; }
@@ -266,11 +415,10 @@ sub search {
 
         my $searchSystemNamespace;
         my $searchTypeNamespace;
-        if ( defined $self->record_types->{$type}->{$searchType} ) {
-            $searchTypeNamespace = $self->record_types->{$type}->{$searchType};
+        if ( defined $record_types->{$type}->{$searchType} ) {
+            $searchTypeNamespace = $record_types->{$type}->{$searchType};
 
-        }
-        else {
+        } else {
             croak "Search type $searchType is not defined in a $type search";
         }
 
@@ -280,20 +428,20 @@ sub search {
             # parent, firstName, lastName
 
             my $searchValue;
-            $searchElement->{prefix} = 'common';
+            $searchElement->{prefix} = namespace('common');
             if ( $searchElement->{attr}->{internalId} ) {
-                $searchElement->{attr}->{'xsi:type'} = 'core:RecordRef';
+                $searchElement->{attr}->{'xsi:type'} = namespace('core') . ':RecordRef';
                 push @searchTypes, SOAP::Data->new( %{$searchElement} );
                 next;
             }
             else {
 
                 my $searchElementType =
-                  $self->search_types->{$searchTypeNamespace}
+                  $search_types->{$searchTypeNamespace}
                   ->{ $searchElement->{name} };
 
                 $searchElement->{attr}->{'xsi:type'} =
-                  'core:' . $searchElementType;
+                  namespace('core') . ':' . $searchElementType;
 
                 if (    $searchElementType eq 'SearchDateField'
                     and $searchElement->{value} =~ /^\D+$/ )
@@ -307,12 +455,11 @@ sub search {
                 my @searchValues;
                 for my $searchValue ( @{ $searchElement->{value} } )
                 {                                              # customField
-
                     if ( ref $searchValue->{value} eq 'ARRAY' ) {
                         my @customFieldValues;
                         for my $customFieldValue ( @{ $searchValue->{value} } )
                         {
-                            $customFieldValue->{prefix} = 'core'
+                            $customFieldValue->{prefix} = namespace('core')
                               if !defined $customFieldValue->{prefix};
                             $customFieldValue->{name} = 'searchValue'
                               if !defined $customFieldValue->{name};
@@ -324,7 +471,7 @@ sub search {
                         push @searchValues, SOAP::Data->new( %{$searchValue} );
                     }
                     else {
-                        $searchValue->{prefix} = 'core'
+                        $searchValue->{prefix} = namespace('core')
                           if !defined $searchValue->{prefix};
                         $searchValue->{name} = 'searchValue'
                           if !defined $searchValue->{name};
@@ -332,7 +479,7 @@ sub search {
                             my $customFieldValue = {
                                 name   => 'searchValue',
                                 value  => $searchValue->{value},
-                                prefix => 'core'
+                                prefix => namespace('core')
                             };
                             $searchValue->{value} =
                               \SOAP::Data->new( %{$customFieldValue} );
@@ -340,7 +487,7 @@ sub search {
                         else {
                             if ( $searchValue->{attr}->{internalId} ) {
                                 $searchValue->{attr}->{'xsi:type'} =
-                                  'core:RecordRef';
+                                  namespace('core') . ':RecordRef';
                             }
                         }
                         push @searchValues, SOAP::Data->new( %{$searchValue} );
@@ -356,10 +503,10 @@ sub search {
                 $searchValue->{value} = $searchElement->{value}
                   if !defined $searchValue->{value};
 
-                $searchValue->{prefix} = 'core'
+                $searchValue->{prefix} = namespace('core')
                   if !defined $searchValue->{prefix};
 
-                $searchValue->{attr}->{'xsi:type'} = 'core:RecordRef'
+                $searchValue->{attr}->{'xsi:type'} = namespace('core') . ':RecordRef'
                   if $searchElement->{attr}->{internalId};
 
                 $searchElement->{value} =
@@ -373,7 +520,7 @@ sub search {
           SOAP::Data->name( $searchType => \SOAP::Data->value(@searchTypes) )
           ->attr(
             {
-                'xsi:type' => 'common:' . $searchTypeNamespace
+                'xsi:type' => namespace('common') . ':' . $searchTypeNamespace
             }
           );
 
@@ -385,16 +532,16 @@ sub search {
         SOAP::Header->name(
             'searchPreferences' => \SOAP::Header->value(
                 SOAP::Header->name('bodyFieldsOnly')
-                  ->value( $header->{bodyFieldsOnly} )->prefix('messages'),
+                  ->value( $header->{bodyFieldsOnly} )->prefix(namespace('messages')),
                 SOAP::Header->name('pageSize')->value( $header->{pageSize} )
-                  ->prefix('messages'),
+                  ->prefix(namespace('messages')),
             )
-          )->prefix('messages'),
+          )->prefix(namespace('messages')),
         SOAP::Data->name(
             'searchRecord' => \SOAP::Data->value(@searchRecord)
           )->attr(
             {
-                'xsi:type' => $self->search_namespaces->{$type} . ':' . $type
+                'xsi:type' => $search_namespaces->{$type} . ':' . $type
             }
           )
     );
@@ -443,7 +590,7 @@ sub searchMore {
     $self->soap->on_action( sub { return 'searchMore'; } );
     my $som =
       $self->soap->searchMore( $self->_passport,
-        SOAP::Data->name('pageIndex')->value($pageIndex)->prefix('messages') );
+        SOAP::Data->name('pageIndex')->value($pageIndex)->prefix(namespace('messages')) );
 
     if ( $som->fault ) { $self->error; }
     else {
@@ -462,7 +609,6 @@ sub searchMore {
         }
         else { $self->error; }
     }
-
 }
 
 sub searchNext {
@@ -488,7 +634,6 @@ sub searchNext {
         }
         else { $self->error; }
     }
-
 }
 
 sub delete {
@@ -501,7 +646,7 @@ sub delete {
             {
                 'internalId' => $recordInternalId,
                 'type'       => $recordType,
-                'xsi:type'   => 'core:RecordRef'
+                'xsi:type'   => namespace('core') . ':RecordRef'
             }
         )
     );
@@ -553,26 +698,20 @@ sub map_sso {
                 ),
                 SOAP::Data->name( 'partnerId' => $self->nsaccount ),
                 SOAP::Data->name('role')->attr( { 'internalId' => $role_id } )
-
             ),
         ),
     );
 
     if ( $som->fault ) {
         die "could not map_sso for user $user_id - " . $som->fault;
-
-    }
-    else {
+    } else {
         if ( $som->dataof("//mapSsoResponse/sessionResponse/status")
-            ->attr->{'isSuccess'} eq 'true' )
-        {
+            ->attr->{'isSuccess'} eq 'true' ) {
             return 1;
-        }
-        else {
+        } else {
             die "could not map_sso for user $user_id, role $role_id";
         }
     }
-
 }
 
 sub sso_url {
@@ -650,10 +789,31 @@ sub _generate_auth_token {
 }
 
 sub add {
-    my ( $self, $recordType, $recordRef ) = @_;
+    my ( $self, $recordType, $recordRef, %recordAttrs ) = @_;
+    my $ns = $record_namespaces->{$recordType};
+    if (!defined($ns)) {
+        my $i = index($recordType, ':');
+        if ($i < 0) {
+            fatal "Invalid recordType: $recordType!";
+        } else {
+            $ns = substr($recordType, 0, $i);
+            $recordType = substr($recordType, $i+1);
+        }
+    }
+    deb "namespace for $recordType is " . $ns . "\n"; 
+    my %recAttrs = (
+                'xsi:type' => $ns . ':' . ucfirst($recordType)
+    );
 
-    $self->error("Invalid recordType: $recordType!")
-      if !defined $self->record_namespaces->{$recordType};
+    # Add recordAttrs to recAttrs.  This supports cases like where
+    # ExpenseReport supports adding externalId attr on the <record>
+    # element.  recordAttrs argument is optional and passed only when
+    # needed.
+    if (%recordAttrs) {
+        foreach my $x ( keys %recordAttrs ){
+            $recAttrs{ $x } = $recordAttrs{ $x };
+        }
+    }
 
     $self->soap->on_action( sub { return 'add'; } );
     my $som = $self->soap->add(
@@ -662,32 +822,62 @@ sub add {
             'record' => \SOAP::Data->value(
                 $self->_parseRequest( ucfirst($recordType), $recordRef )
             )
-          )->attr(
-            {
-                'xsi:type' => $self->record_namespaces->{$recordType} . ':'
-                  . ucfirst($recordType)
-            }
-          )
+          )->attr(\%recAttrs)
     );
 
-    if ( $som->fault ) { $self->error; }
-    else {
+    if ( $som->fault ) {
+        $self->error;
+    } else {
         if ( $som->dataof("//addResponse/writeResponse/status")
-            ->attr->{'isSuccess'} eq 'true' )
-        {
+            ->attr->{'isSuccess'} eq 'true' ) {
             return $som->dataof("//addResponse/writeResponse/baseRef")
               ->attr->{'internalId'};
+        } else {
+            $self->error;
         }
-        else {
+    }
+}
 
-            my $status_code = $som->dataof(
-                "//addResponse/writeResponse/status/statusDetail/code")->value;
-            if ($status_code) {
-                die $status_code;
-            }
-            else {
-                die "unknown error";
-            }
+sub upsert {
+    my ( $self, $recordType, $recordRef, %recordAttrs ) = @_;
+
+    fatal("Invalid recordType: $recordType!")
+      if !defined $record_namespaces->{$recordType};
+
+    my %recAttrs = (
+                'xsi:type' => $record_namespaces->{$recordType} . ':'
+                  . ucfirst($recordType)
+    );
+
+    # Add recordAttrs to recAttrs.  This supports cases like where
+    # ExpenseReport supports upserting externalId attr on the <record>
+    # element.  recordAttrs argument is optional and passed only when
+    # needed.
+    if (%recordAttrs) {
+        foreach my $x ( keys %recordAttrs ){
+            $recAttrs{ $x } = $recordAttrs{ $x };
+        }
+    }
+
+    $self->soap->on_action( sub { return 'upsert'; } );
+    my $som = $self->soap->upsert(
+        $self->_passport,
+        SOAP::Data->name(
+            'record' => \SOAP::Data->value(
+                $self->_parseRequest( ucfirst($recordType), $recordRef )
+            )
+          )->attr(\%recAttrs)
+    );
+
+    if ( $som->fault ) {
+        $self->error;
+    } else {
+        if ( $som->dataof("//upsertResponse/writeResponse/status")
+            ->attr->{'isSuccess'} eq 'true' ) {
+            return $som->dataof("//upsertResponse/writeResponse/baseRef")
+              ->attr->{'internalId'};
+        } else {
+            $self->error;
         }
     }
 }
@@ -699,7 +889,7 @@ sub update {
     delete $recordRef->{internalId};
 
     $self->error("Invalid recordType: $recordType!")
-      if !defined $self->record_namespaces->{$recordType};
+      if !defined $record_namespaces->{$recordType};
 
     $self->soap->on_action( sub { return 'update'; } );
     my $som = $self->soap->update(
@@ -710,27 +900,97 @@ sub update {
             )
           )->attr(
             {
-                'xsi:type' => $self->record_namespaces->{$recordType} . ':'
+                'xsi:type' => $record_namespaces->{$recordType} . ':'
                   . ucfirst($recordType),
                 'internalId' => $internalId
             }
           )
     );
 
-    if ( $som->fault ) { $self->error; }
-    else {
+    if ( $som->fault ) {
+        $self->error;
+    } else {
         if ( $som->match("//updateResponse/writeResponse/status") ) {
             if ( $som->dataof("//updateResponse/writeResponse/status")
-                ->attr->{'isSuccess'} eq 'true' )
-            {
+                ->attr->{'isSuccess'} eq 'true' ) {
                 return $som->dataof("//updateResponse/writeResponse/baseRef")
                   ->attr->{'internalId'};
+            } else {
+                $self->error;
             }
-            else { $self->error; }
+        } else {
+            $self->error;
         }
-        else { $self->error; }
     }
+}
 
+sub attach {
+    my ( $self, $attachRequest ) = @_;
+
+    # example usage:
+    #    sub nsRecRef {
+    #        my ($rectype, $id) = @_;
+    #        return  { type => $rectype, internalId => $id };
+    #    }
+    #
+    #    my $attachRequest = {
+    #        attachTo        => nsRecRef('expenseReport', $erId),
+    #        attachedRecord  => nsRecRef('file',          $fid)
+    #    };
+    #    $ns->attach($attachRequest) or nsfatal 'error attaching';
+    # 
+    #   SOAP message will look something like this:
+    #
+    # <attach>
+    #   <attachReferece xsi:type="core_2013_2.platform:AttachBasicReference">
+    #     <attachTo internalId="2029" type="expenseReport"
+    #               xsi:type="core_2013_2.platform:RecordRef" />
+    #     
+    #     <attachedRecord internalId="5445" type="file"
+    #               xsi:type="core_2013_2.platform:RecordRef" />
+    #   </attachReferece>
+    # </attach>
+    #
+    # Only AttachBasicReference is supported at this time.
+
+
+    $self->soap->on_action( sub { return 'attach'; } );
+    my $attachTo = SOAP::Data->name('attachTo')->attr( {
+                internalId => $attachRequest->{attachTo}->{internalId},
+                type       => $attachRequest->{attachTo}->{type},
+                'xsi:type' => namespace('core') . ':RecordRef'
+            });
+    my $attachedRecord = SOAP::Data->name('attachedRecord')->attr( {
+                internalId => $attachRequest->{attachedRecord}->{internalId},
+                type       => $attachRequest->{attachedRecord}->{type},
+                'xsi:type' => namespace('core') . ':RecordRef'
+            });
+
+
+    my $som = $self->soap->attach(
+        $self->_passport,
+            SOAP::Data->name(
+                'attachReferece' => \SOAP::Data->value(
+                    $attachTo,
+                    $attachedRecord
+                ))->attr({'xsi:type' => namespace('core') . ':AttachBasicReference'})
+    );
+
+    if ( $som->fault ) {
+        $self->error;
+    } else {
+        if ( $som->match("//attachResponse/writeResponse/status") ) {
+            if ( $som->dataof("//attachResponse/writeResponse/status")
+                ->attr->{'isSuccess'} eq 'true' ) {
+                return $som->dataof("//attachResponse/writeResponse/baseRef")
+                  ->attr->{'internalId'};
+            } else {
+                $self->error;
+            }
+        } else {
+            $self->error;
+        }
+    }
 }
 
 sub error {
@@ -749,15 +1009,15 @@ sub error {
     $self->_logTransport( $self->{ERRORDIR}, $method )
       if $self->{ERRORDIR};
     return;
-
 }
 
 sub errorResults {
     my ($self) = shift;
     if ( defined $self->{ERROR_RESULTS} ) {
         return $self->{ERROR_RESULTS};
+    } else {
+        return;
     }
-    else { return; }
 }
 
 sub _parseRequest {
@@ -765,21 +1025,17 @@ sub _parseRequest {
 
     my @requestSoap;
     while ( my ( $key, $value ) = each %{$requestRef} ) {
-
         if ( ref $value eq 'ARRAY' ) {
-
             my $listElementName = $key;
             $listElementName =~ s/^(.*)List$/$1/;
 
             my @listElements;
             for my $listElement ( @{ $requestRef->{$key} } ) {
-
                 my @sequence;
 
                 # if the listElement is customField
                 # handle it differently
                 if ( $listElementName eq 'customField' ) {
-
                     my $element;
 
                     $element->{name} = 'customField';
@@ -791,11 +1047,10 @@ sub _parseRequest {
                       $listElement->{type};
 
                     $element->{value} = \SOAP::Data->name('value')
-                      ->value( $listElement->{value} );
+                      ->value( $listElement->{value} )
+                      ; # ->attr( { 'xsi:type' => 'xsd:string' } );
                     push @listElements, SOAP::Data->new( %{$element} );
-                }
-                else {
-
+                } else { 
                     while ( my ( $key, $value ) = each %{$listElement} ) {
                         push @sequence,
                           $self->_parseRequestField(
@@ -805,8 +1060,7 @@ sub _parseRequest {
                     push @listElements,
                       SOAP::Data->name(
                         $listElementName => \SOAP::Data->value(@sequence) );
-                }
-
+                } 
             }
 
             if ( grep $_ eq $key, qw(addressbookList creditCardsList) ) {
@@ -818,9 +1072,7 @@ sub _parseRequest {
                 push @requestSoap,
                   SOAP::Data->name( $key => \SOAP::Data->value(@listElements) );
             }
-
-        }
-        else {
+        } else {
             push @requestSoap,
               $self->_parseRequestField( $requestType, $key, $value );
         }
@@ -833,17 +1085,25 @@ sub _parseRequestField {
     my ( $self, $type, $key, $value ) = @_;
 
     my $element;
-    if ( $self->record_fields->{$type}->{$key} eq 'core:RecordRef' ) {
-        $element->{attr}->{internalId} = $value;
+    if (defined($record_fields->{$type}->{$key}) &&
+            $record_fields->{$type}->{$key} eq namespace('core') . ':RecordRef' ) {
+        if (ref($value) eq "HASH") {
+            my %v = %{$value};
+            $element->{attr}->{internalId} = $v{internalId};
+            $element->{attr}->{type} = $v{type};
+        } else {
+            $element->{attr}->{internalId} = $value;
+        }
     }
-    else { $element->{value} = $value; }
+    else {
+        $element->{value} = $value;
+    }
     $element->{name} = $key;
 
     $element->{attr}->{'xsi:type'} =
-      $self->record_fields->{$type}->{$key};
+      $record_fields->{$type}->{$key};
 
     return SOAP::Data->new( %{$element} );
-
 }
 
 sub _logTransport {
@@ -877,7 +1137,6 @@ sub _logTransport {
     );
 
     if ( !$flag ) { croak "Unable to create file $dir/$xmlResponse" }
-
 }
 
 sub _parseResponse {
@@ -902,41 +1161,26 @@ sub _parseResponse {
     $self->{LAST_HEAD} = $head;
     $self->{LAST_BODY} = $body;
 
-    if ( $method eq 'error' ) {
-
+    my $c = $body->{content}->[0]->{content};
+    if ($method eq 'error') {
         # if the error is NOT being produced by the login function, the
         # structure is different, so the parsing must be different
-        if (
-            ref $body->{content}->[0]->{content}->[0]->{content}->[0]->{content}
-            eq 'ARRAY' )
-        {
-            return &_parseFamily(
-                $body->{content}->[0]->{content}->[0]->{content}->[0]->{content}
-            );
+        deb 'error body=' . Dumper($body);
+        if (ref $c->[0]->{content}->[0]->{content} eq 'ARRAY' ) {
+            return &_parseFamily($c->[0]->{content}->[0]->{content});
+        } elsif (nvl($c->[2]->{content}->[0]->{content}->[0]->{name},'')
+                    =~ m/platformFaults:code/ ) {
+            return &_parseFamily($c->[2]->{content}->[0]->{content});
+        } elsif ($c->[2]->{content}->[0]->{name} eq 'ns1:hostname') {
+            return &_parseFamily( $c );
+        } else {
+            fatal 'Unable to parse error response!  Contact module author..';
         }
-        elsif ( $body->{content}->[0]->{content}->[2]->{content}->[0]->{content}
-            ->[0]->{name} =~ m/ns1:code/ )
-        {
-            return &_parseFamily(
-                $body->{content}->[0]->{content}->[2]->{content}->[0]->{content}
-            );
-        }
-        elsif (
-            $body->{content}->[0]->{content}->[2]->{content}->[0]->{name} eq
-            'ns1:hostname' )
-        {
-            return &_parseFamily( $body->{content}->[0]->{content} );
-        }
-        else {
-            croak 'Unable to parse error response!  Contact module author..';
-        }
-    }
-    elsif ( ref $body->{content}->[0]->{content}->[0]->{content} eq 'ARRAY' ) {
-        return &_parseFamily(
-            $body->{content}->[0]->{content}->[0]->{content} );
-    }
-    else { return; }
-
+    } elsif ( ref $c->[0]->{content} eq 'ARRAY' ) {
+        return &_parseFamily($c->[0]->{content});
+    } else {
+        return;
+    } 
 }
 
 sub _parseFamily {
@@ -953,49 +1197,37 @@ sub _parseFamily {
             if ( scalar @{ $node->{content} } == 1 ) {
                 if ( ref $node->{content}->[0]->{content} eq 'ARRAY' ) {
                     if ( scalar @{ $node->{content}->[0]->{content} } > 1 ) {
-
  #$parse_ref->{$node->{name}} = &_parseFamily($node->{content}->[0]->{content});
                         push @{ $parse_ref->{ $node->{name} } },
                           &_parseFamily( $node->{content} );
-                    }
-                    else {
-
+                    } else { 
                         if ( $node->{name} =~ /List$/ ) {
-                            if (
-                                scalar @{ $node->{content}->[0]->{content} } >
-                                1 )
-                            {
+                            if (scalar @{ $node->{content}->[0]->{content} } >
+                                1 ) {
                                 for ( 0 .. scalar @{ $node->{content} } - 1 ) {
                                     push @{ $parse_ref->{ $node->{name} } },
                                       &_parseFamily(
                                         $node->{content}->[0]->{content} );
                                 }
-                            }
-                            else {
+                            } else {
                                 if ( !ref $node->{content}->[0]->{content}->[0]
-                                    ->{content} )
-                                {
+                                    ->{content} ) {
                                     $parse_ref =
                                       &_parseNode( $node->{content}->[0],
                                         $parse_ref );
-                                }
-                                else {
+                                } else {
                                     push @{ $parse_ref->{ $node->{name} } },
                                       &_parseNode(
                                         $node->{content}->[0]->{content}->[0] );
                                 }
                             }
-                        }
-                        else {
+                        } else {
                             $parse_ref = &_parseNode( $node, $parse_ref );
                         }
-
                     }
                 }
                 else { $parse_ref = &_parseNode( $node, $parse_ref ); }
-            }
-            else {
-
+            } else { 
                 if ( $node->{name} =~ /(List|Matrix)$/ ) {
                     if ( scalar @{ $node->{content}->[0]->{content} } > 1 ) {
                         for ( 0 .. scalar @{ $node->{content} } - 1 ) {
@@ -1007,27 +1239,21 @@ sub _parseFamily {
                                 $record );
                             push @{ $parse_ref->{ $node->{name} } }, $record;
                         }
-                    }
-                    else {
+                    } else {
                         for ( 0 .. scalar @{ $node->{content} } - 1 ) {
                             if ( !ref $node->{content}->[$_]->{content}->[0]
-                                ->{content} )
-                            {
+                                ->{content} ) {
                                 $parse_ref =
                                   &_parseNode( $node->{content}->[$_],
                                     $parse_ref );
-                            }
-                            else {
+                            } else {
 #if ($node->{name} eq 'customFieldList') {
 #    push @{ $parse_ref->{$node->{name}} }, &_parseNode($node->{content}->[$_]);
-#}
                                 if ( !ref $node->{content}->[$_]->{content}->[0]
-                                    ->{content}->[0]->{content} )
-                                {
+                                    ->{content}->[0]->{content} ) {
                                     push @{ $parse_ref->{ $node->{name} } },
                                       &_parseNode( $node->{content}->[$_] );
-                                }
-                                elsif (
+                                } elsif (
                                     ref $node->{content}->[$_]->{content}->[0]
                                     ->{content}->[0]->{content} )
                                 {
@@ -1035,16 +1261,14 @@ sub _parseFamily {
                                       &_parseNode(
                                         $node->{content}->[$_]->{content}->[0]
                                       );
-                                }
-                                else {
+                                } else {
                                     push @{ $parse_ref->{ $node->{name} } },
                                       &_parseNode( $node->{content}->[$_] );
                                 }
                             }
                         }
                     }
-                }
-                else {
+                } else {
                     $parse_ref = &_parseFamily( $node->{content}, $parse_ref );
                 }
             }
@@ -1057,9 +1281,9 @@ sub _parseFamily {
             $store_ref->{$key} = $val;
         }
         return $store_ref;
+    } else {
+        return $parse_ref;
     }
-    else { return $parse_ref; }
-
 }
 
 sub _parseAttributes {
@@ -1077,8 +1301,7 @@ sub _parseAttributes {
                 $hash_ref->{attrib}->{$attrib} =~ s/^(.*:)?(.*)$/lcfirst($2)/eg;
                 $parse_ref->{ $hash_ref->{name} . 'Type' } =
                   $hash_ref->{attrib}->{$attrib};
-            }
-            else {
+            } else {
                 $parse_ref->{ $hash_ref->{name} . ucfirst($attrib) } =
                   $hash_ref->{attrib}->{$attrib};
             }
@@ -1090,9 +1313,9 @@ sub _parseAttributes {
             $store_ref->{$key} = $val;
         }
         return $store_ref;
+    } else {
+        return $parse_ref;
     }
-    else { return $parse_ref; }
-
 }
 
 sub _parseNode {
@@ -1103,21 +1326,18 @@ sub _parseNode {
         $hash_ref->{name} =~ s/^(.*:)?(.*)$/$2/g;
     }
 
-    if ( scalar @{ $hash_ref->{content} } == 1 ) {
-
+    if ( scalar @{ $hash_ref->{content} } == 1 ) { 
  # if the name of the inner attribute is "name", then only worry about the value
         if ( defined $hash_ref->{content}->[0]->{name} ) {
             $hash_ref->{content}->[0]->{name} =~ /^(.*:)?(name|value)$/;
             if ( defined $hash_ref->{content}->[0]->{attrib}->{internalId} ) {
                 $parse_ref->{ $hash_ref->{name} . ucfirst($2) } =
                   $hash_ref->{content}->[0]->{attrib}->{internalId};
-            }
-            else {
+            } else {
                 $parse_ref->{ $hash_ref->{name} . ucfirst($2) } =
                   $hash_ref->{content}->[0]->{content}->[0]->{content};
             }
-        }
-        else {
+        } else {
             if ( defined $hash_ref->{content}->[0]->{content} ) {
                 if ( !ref $hash_ref->{content}->[0]->{content} ) {
                     $parse_ref->{ $hash_ref->{name} } =
@@ -1134,9 +1354,9 @@ sub _parseNode {
             $store_ref->{$key} = $val;
         }
         return $store_ref;
+    } else {
+        return $parse_ref;
     }
-    else { return $parse_ref; }
-
 }
 
 1;
@@ -1152,12 +1372,20 @@ WebService::NetSuite - A perl  interface to the NetSuite SuiteTalk (Web Services
     use WebService::NetSuite;
   
     my $ns = WebService::NetSuite->new({
-        nsrole     => 3,
-        nsemail    => 'blarg@foo.com',
-        nspassword => 'foobar123',
-        nsaccount  => 123456,
-        sandbox    => 1,
+        nsemail         => 'blarg@foo.com',
+        nspassword      => 'foobar123',
+        nsroleName      => 'Administrator',
+        nsaccountName   => 'My NS Account',
     });
+
+    # old 'new' method still supported, but discouraged:
+    #my $ns = WebService::NetSuite->new({
+    #    nsrole     => 3,
+    #    nsemail    => 'blarg@foo.com',
+    #    nspassword => 'foobar123',
+    #    nsaccount  => 123456,
+    #    sandbox    => 1,
+    #});
 
     my $customer_id = $ns->add( 'customer',
         { firstName  => 'Gonzo',
@@ -1182,6 +1410,39 @@ This reboot of the original NetSuite module is still rough and under constructio
 NetSuite Help Center - https://system.sandbox.netsuite.com/app/help/helpcenter.nl
 
 You'll need a NetSuite login to get to the help center unfortunately. Silly NetSuite.
+
+=head2 new(%options)
+
+The new method creates the WebService::NetSuite object and the underlying SOAP
+object that is used to communicate with NetSuite.  The new symtax automatically
+determines the NetSuite host to communicate with based on your email, password,
+and account name:
+
+    NEW SYNTAX:
+
+    my $ns = WebService::NetSuite->new({
+        nsemail         => 'blarg@foo.com',
+        nspassword      => 'foobar123',
+        nsroleName      => 'Administrator',
+        nsaccountName   => 'My NS Account',
+        sandbox         => 0,
+        debug           => 1,
+        debugFile       => 'NetSuite.dbg',
+    });
+
+    OLD SYNTAX:
+
+    my $ns = WebService::NetSuite->new({
+        nsrole          => 3,
+        nsemail         => 'blarg@foo.com',
+        nspassword      => 'foobar123',
+        nsaccount       => 123456,
+        sandbox         => 0,
+        debug           => 1,
+        debugFile       => 'NetSuite.dbg',
+    });
+
+
 
 =head2 add(recordType, hashReference)
 
@@ -1371,7 +1632,7 @@ that exists in a customer's record.  These custom fields are located in the
                         attr => {
                             internalId => 'custentity1',
                             operator => 'anyOf',
-                            'xsi:type' => 'core:SearchMultiSelectCustomField'
+                            'xsi:type' => namespace('core') . ':SearchMultiSelectCustomField'
                         },
                         value => [
                             { attr => { internalId => 1 } },

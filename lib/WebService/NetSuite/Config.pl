@@ -12,7 +12,7 @@ $XML::Parser::EasyTree::Noempty=1;
 use Cwd;
 my $pwd = &Cwd::cwd();
 my $tmp = "$pwd/Config.tmpl";
-my $fil = "$pwd/Config.pm";
+my $fil = "./Config.pm";
 
 unlink $fil;
 
@@ -25,8 +25,16 @@ $ua->timeout(10);
 $ua->env_proxy;
 
 my $debug = 1;
-my $wsdl = 'https://webservices.netsuite.com/wsdl/v2013_1_0/netsuite.wsdl';
-my $searchCommon = 'https://webservices.netsuite.com/xsd/platform/v2013_1_0/common.xsd';
+our $version='2013_2';
+my $wsdl = 'https://webservices.netsuite.com/wsdl/v2013_2_0/netsuite.wsdl';
+my $searchCommon = 'https://webservices.netsuite.com/xsd/platform/v2013_2_0/common.xsd';
+
+# return full namespace for core, messages, common (all are in .platform)
+sub namespace {
+    my ($ns) = @_;
+    return $ns . '_' . $version . '.platform';
+}
+
 
 undef my $hash_ref;
 my $getSearchCommon = $ua->get($searchCommon);
@@ -70,8 +78,13 @@ if ($getWsdl->is_success) {
     for my $node (@{ $wsdl->[0]->{content}->[0]->{content}->[0]->{content} }) {
         my $namespace = $node->{attrib}->{namespace};
         print "Accessing namespace $namespace\n";
-        my ($mapping) = ($node->{attrib}->{namespace} =~ /^urn:(.*)_(\d+)_(\d+).*$/);
-        if ($mapping =~ /^types.(.*)/) { $mapping = $1 . 'Types'; }
+        #my ($mapping) = ($node->{attrib}->{namespace} =~ /^urn:(.*)_(\d+)_(\d+).*$/);
+        my $mapping = $namespace;
+        $mapping =~ s/urn://;
+        $mapping =~ s/types\.//;
+        $mapping =~ s/\.webservices\.netsuite\.com//;
+        #print "mapping= $mapping\n";
+        #if ($mapping =~ /^types.(.*)/) { $mapping = $1 . 'Types'; }
         print "Parsed namespaces to $mapping\n";
         $systemNamespaces->{$mapping} = $namespace if !defined $systemNamespaces->{$mapping};
         
@@ -83,8 +96,11 @@ if ($getWsdl->is_success) {
                 if ($element->{name} eq 'xsd:import' or $element->{name} eq 'import') {
                     my $namespace = $element->{attrib}->{namespace};
                     print "Accessing namespace $namespace\n";
-                    my ($mapping) = ($element->{attrib}->{namespace} =~ /^urn:(.*)_(\d+)_(\d+).*$/);
-                    if ($mapping =~ /^types.(.*)/) { $mapping = $1 . 'Types'; }
+                    $mapping =~ s/urn://;
+                    $mapping =~ s/types\.//;
+                    $mapping =~ s/\.webservices\.netsuite\.com//;
+                    #my ($mapping) = ($element->{attrib}->{namespace} =~ /^urn:(.*)_(\d+)_(\d+).*$/);
+                    #if ($mapping =~ /^types.(.*)/) { $mapping = $1 . 'Types'; }
                     print "Parsed namespaces to $mapping\n";
                     $systemNamespaces->{$mapping} = $namespace if !defined $systemNamespaces->{$mapping};
                 }
@@ -101,10 +117,17 @@ if ($getWsdl->is_success) {
         };
     }
     
+    undef my %recNamespace;
+
     for my $node (@{ $wsdl->[0]->{content}->[0]->{content}->[0]->{content} }) {
-        $node->{attrib}->{namespace} =~ s/^urn:(.*)_(\d+)_(\d+).*$/$1/g;
+        #$node->{attrib}->{namespace} =~ s/^urn:(.*)_(\d+)_(\d+).*$/$1/g;
+        $node->{attrib}->{namespace} =~ s/urn://;
         next if $node->{attrib}->{namespace} =~ /^types/;
-        next if grep $_ eq $node->{attrib}->{namespace}, qw(core faults messages common);
+        $node->{attrib}->{namespace} =~ s/types\.//;
+        $node->{attrib}->{namespace} =~ s/\.webservices\.netsuite\.com//;
+        #next if grep $_ eq $node->{attrib}->{namespace}, qw(core faults messages common);
+        next if grep $node->{attrib}->{namespace} =~ $_, qw(core_ faults_ messages_ common_);
+        #print "Processing ".$node->{attrib}->{namespace}."\n";
         
         my $getSchema = $ua->get($node->{attrib}->{schemaLocation});
         if ($getSchema->is_success) {
@@ -139,11 +162,15 @@ if ($getWsdl->is_success) {
                         
                         undef my @fieldTypes;
                         for my $field (@{ $element->{content}->[0]->{content}->[0]->{content}->[0]->{content} }) {
-                            if ($field->{attrib}->{type} =~ m/^platform(.*)Typ:(.*)$/) {
-                                $field->{attrib}->{type} = lcfirst($1) . 'Types' . ':' . $2;
+                            print '$field->{attrib}=' . Dumper($field->{attrib});
+                            if ($field->{attrib}->{type} =~ m/^xsd:(.*)$/) {
+                                ; # leave xsd type as is
+                            }
+                            elsif ($field->{attrib}->{type} =~ m/^platform(.*)Typ:(.*)$/) {
+                                $field->{attrib}->{type} = namespace(lcfirst($1)) . 'Types' . ':' . $2;
                             }
                             elsif ($field->{attrib}->{type} =~ m/^platform(.*):(.*)$/) {
-                                $field->{attrib}->{type} = lcfirst($1) . ':' . $2;
+                                $field->{attrib}->{type} = namespace(lcfirst($1)) . ':' . $2;
                             }
                             elsif ($field->{attrib}->{type} =~ m/^.*Typ:(.*)$/) {
                                 $field->{attrib}->{type} = $node->{attrib}->{namespace} . 'Types' . ':' . $1;
@@ -168,8 +195,14 @@ if ($getWsdl->is_success) {
                         
                         undef my @fieldTypes;
                         for my $field (@{ $element->{content}->[0]->{content} }) {
-                            if ($field->{attrib}->{type} =~ m/^platform(.*):(.*)$/) {
-                                $field->{attrib}->{type} = lcfirst($1) . ':' . $2;
+                            if ($field->{attrib}->{type} =~ m/^xsd:(.*)$/) {
+                                ; # leave xsd type as is
+                            }
+                            elsif ($field->{attrib}->{type} =~ m/^platform(.*)Typ:(.*)$/) {
+                                $field->{attrib}->{type} = namespace(lcfirst($1)) . 'Types' . ':' . $2;
+                            }
+                            elsif ($field->{attrib}->{type} =~ m/^platform(.*):(.*)$/) {
+                                $field->{attrib}->{type} = namespace(lcfirst($1)) . ':' . $2;
                             }
                             elsif ($field->{attrib}->{type} =~ m/^.*Typ:(.*)$/) {
                                 $field->{attrib}->{type} = $node->{attrib}->{namespace} . 'Types' . ':' . $1;
@@ -191,17 +224,24 @@ if ($getWsdl->is_success) {
                         
                     }
                 }
-                if ($element->{name} eq 'element') {
-                    if ($element->{attrib}->{name} =~ /Search$/) {
-                        push @searchNamespaces, {
-                            type => ucfirst($element->{attrib}->{name}),
-                            namespace => $node->{attrib}->{namespace},
-                        };
-                    } else {
-                        push @recordNamespaces, {
-                            type => lcfirst($element->{attrib}->{name}),
-                            namespace => $node->{attrib}->{namespace},
-                        };
+                if (defined($element->{attrib}->{name})) {
+                    my $eleName = lcfirst($element->{attrib}->{name});
+                    if (($element->{name} eq 'element') ||
+                        (($element->{name} eq 'complexType')
+                         && defined($element->{content}->[0]->{content}->[0]->{attrib}->{base})
+                         && $element->{content}->[0]->{content}->[0]->{attrib}->{base} eq 'platformCore:Record')) {
+                        if ($element->{attrib}->{name} =~ /Search$/) {
+                            push @searchNamespaces, {
+                                type => ucfirst($element->{attrib}->{name}),
+                                namespace => $node->{attrib}->{namespace},
+                            };
+                        } elsif (!defined($recNamespace{$eleName})) {
+                            push @recordNamespaces, {
+                                type => $eleName,
+                                namespace => $node->{attrib}->{namespace},
+                            };
+                            $recNamespace{$eleName} = $node->{attrib}->{namespace};
+                        }
                     }
                 }
             }
@@ -209,6 +249,7 @@ if ($getWsdl->is_success) {
         else { die $getSchema->status_line; } 
     }
     
+    #print "recordFields\n" . Dumper(@recordFields);
     $hash_ref->{recordFields} = \@recordFields;
     $hash_ref->{searchNamespaces} = \@searchNamespaces;
     $hash_ref->{recordNamespaces} = \@recordNamespaces;

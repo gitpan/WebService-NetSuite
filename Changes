@@ -1,5 +1,14 @@
 Revision history for Perl extension WebService::NetSuite.
 
+0.03 2014-01-23
+    - Changed usage to use names instead of IDs [github/dbeusee]
+    - Look up correct netsuite domain (datacenter) to use (netsuite.com, na1.netsuite.com, sandbox.netsuite.com, etc). Old usage still supported for backward
+compatibility, but new usage is recommended. [github/dbeusee]
+    - Use more fully qualified namespaces so that things like ExpenseReport request can work. [github/dbeusee]
+    - Better error handling [github/dbeusee]
+    - Added options for debugging - send debug info to a file (NetSuite.dbg by default) including SOAP request and reply and some additional debug messages. [github/dbeusee]
+    - Allow add request to include attributes to the element (ExpenseReport record takes externalId element for instance). [github/dbeusee]
+
 0.02 2013-10-11
     - add company id parameter to cart url to speed up redirects
     - RT 88790, updated changes file to conform to CPAN::Changes::Spec
