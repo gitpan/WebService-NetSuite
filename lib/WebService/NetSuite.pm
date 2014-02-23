@@ -13,14 +13,14 @@ use JSON;
 use XML::Parser;
 use XML::Parser::EasyTree;
 $XML::Parser::EasyTree::Noempty = 1;
-
+use Storable qw(dclone);
 use Crypt::OpenSSL::RSA;
 use Encode;
 
 use WebService::NetSuite::Config;
 
 our $ME = 'WebService::NetSuite';
-our $VERSION = '0.03';
+our $VERSION = '0.04';
 
 our $nsversion = "2013_2";
 
@@ -289,11 +289,13 @@ sub namespace {
 #
 
 sub getSelectValue {
-    my ( $self, $recordType ) = @_;
+    my ( $self, $fieldDescHash, $pageIndex ) = @_;
 
     $self->soap->on_action( sub { return 'getSelectValue'; } );
     my $som = $self->soap->getSelectValue( $self->_passport,
-        SOAP::Data->name('fieldName')->attr( { 'fieldType' => $recordType } ) );
+        SOAP::Data->name('fieldDescription' => $fieldDescHash),
+        SOAP::Data->name('pageIndex' => $pageIndex || 1)
+    );
 
     if ( $som->fault ) { $self->error; }
     else {
@@ -356,18 +358,25 @@ sub getCustomization {
 }
 
 sub get {
-    my ( $self, $recordType, $recordInternalId ) = @_;
+    my ( $self, $recordType, $hashOrInternalId ) = @_;
+    undef my %req;
+
+    $req{'type'}        = $recordType;
+    $req{'xsi:type'}    = namespace('core') . ':RecordRef';
+
+    if (ref($hashOrInternalId) eq'HASH') {
+        foreach my $k (keys %{$hashOrInternalId}) {
+            $req{$k} = $hashOrInternalId->{$k};
+        }
+    } else {
+        $req{'internalId'} = $hashOrInternalId;
+    }
 
     $self->soap->on_action( sub { return 'get'; } );
     my $som = $self->soap->get(
         $self->_passport,
-        SOAP::Data->name('baseRef')->attr(
-            {
-                'internalId' => $recordInternalId,
-                'type'       => $recordType,
-                'xsi:type'   => namespace('core') . ':RecordRef'
-            }
-        )->prefix(namespace('messages'))
+        SOAP::Data->name('baseRef')->attr(\%req)
+            ->prefix(namespace('messages'))
     );
 
     if ( $som->fault ) { $self->error; }
@@ -405,6 +414,9 @@ sub search {
 
     croak 'Non HASH reference passed to subroutine search!'
       if ref $request ne 'HASH';
+
+    # don't modify original hash - make a copy of it
+    $request = dclone($request);
 
     if ( $type !~ /Search$/ ) { $type = ucfirst($type) . 'Search'; }
 
@@ -523,7 +535,6 @@ sub search {
                 'xsi:type' => namespace('common') . ':' . $searchTypeNamespace
             }
           );
-
     }
 
     $self->soap->on_action( sub { return 'search'; } );
@@ -547,7 +558,7 @@ sub search {
     );
     # $DB::single = 1;
     if ( $som->fault ) {
-        die $som->fault->{faultstring};
+        $self->error;
     }
     else {
         if ( $som->match("//searchResponse/searchResult/status") ) {
@@ -560,20 +571,17 @@ sub search {
                     return 1;
                 }
                 else {
-                    die "request unsuccessful: " . Dumper($response);
+                    $self->error;
                 }
             }
             else {
-                my $code = $som->dataof("//searchResponse/searchResult/status/statusDetail/code")->value;
-                my $msg = $som->dataof("//searchResponse/searchResult/status/statusDetail/message")->value;
-                die "request unsuccessful, code '$code', message '$msg'";
+                $self->error;
             }
         }
         else {
-            die "request unsuccessful: " . Dumper($som);
+            $self->error;
         }
     }
-
 }
 
 sub searchResults {
@@ -586,16 +594,19 @@ sub searchResults {
 
 sub searchMore {
     my ( $self, $pageIndex ) = @_;
+    my $searchId = $self->{SEARCH_RESULTS}->{'searchId'};
 
-    $self->soap->on_action( sub { return 'searchMore'; } );
+    $self->soap->on_action( sub { return 'searchMoreWithId'; } );
     my $som =
-      $self->soap->searchMore( $self->_passport,
-        SOAP::Data->name('pageIndex')->value($pageIndex)->prefix(namespace('messages')) );
+      $self->soap->searchMoreWithId( $self->_passport,
+        SOAP::Data->name('searchId')->value($searchId),
+        SOAP::Data->name('pageIndex')->value($pageIndex)
+      );
 
     if ( $som->fault ) { $self->error; }
     else {
-        if ( $som->match("//searchMoreResponse/searchResult/status") ) {
-            if ( $som->dataof("//searchMoreResponse/searchResult/status")
+        if ( $som->match("//searchMoreWithIdResponse/searchResult/status") ) {
+            if ( $som->dataof("//searchMoreWithIdResponse/searchResult/status")
                 ->attr->{'isSuccess'} eq 'true' )
             {
                 my $response = $self->_parseResponse;
@@ -613,42 +624,30 @@ sub searchMore {
 
 sub searchNext {
     my $self = shift;
-
-    $self->soap->on_action( sub { return 'searchNext'; } );
-    my $som = $self->soap->searchNext;
-
-    if ( $som->fault ) { $self->error; }
-    else {
-        if ( $som->match("//searchNextResponse/searchResult/status") ) {
-            if ( $som->dataof("//searchNextResponse/searchResult/status")
-                ->attr->{'isSuccess'} eq 'true' )
-            {
-                my $response = $self->_parseResponse;
-                $self->{SEARCH_RESULTS} = $response;
-                if ( $response->{statusIsSuccess} eq 'true' ) {
-                    return 1;
-                }
-                else { $self->error; }
-            }
-            else { $self->error; }
-        }
-        else { $self->error; }
-    }
+    my $page = $self->{SEARCH_RESULTS}->{'pageIndex'};
+    return $self->searchMore(++$page);
 }
 
 sub delete {
-    my ( $self, $recordType, $recordInternalId ) = @_;
+    my ( $self, $recordType, $hashOrInternalId ) = @_;
+    undef my %req;
+
+    $req{'type'}        = $recordType;
+    $req{'xsi:type'}    = namespace('core') . ':RecordRef';
+
+    if (ref($hashOrInternalId) eq'HASH') {
+        foreach my $k (keys %{$hashOrInternalId}) {
+            $req{$k} = $hashOrInternalId->{$k};
+        }
+    } else {
+        $req{'internalId'} = $hashOrInternalId;
+    }
 
     $self->soap->on_action( sub { return 'delete'; } );
     my $som = $self->soap->delete(
         $self->_passport,
-        SOAP::Data->name('baseRef')->attr(
-            {
-                'internalId' => $recordInternalId,
-                'type'       => $recordType,
-                'xsi:type'   => namespace('core') . ':RecordRef'
-            }
-        )
+        SOAP::Data->name('baseRef')->attr(\%req)
+            ->prefix(namespace('messages'))
     );
 
     if ( $som->fault ) { $self->error; }
@@ -789,7 +788,7 @@ sub _generate_auth_token {
 }
 
 sub add {
-    my ( $self, $recordType, $recordRef, %recordAttrs ) = @_;
+    my ( $self, $recordType, $recordRef, $recordAttrs ) = @_;
     my $ns = $record_namespaces->{$recordType};
     if (!defined($ns)) {
         my $i = index($recordType, ':');
@@ -809,9 +808,9 @@ sub add {
     # ExpenseReport supports adding externalId attr on the <record>
     # element.  recordAttrs argument is optional and passed only when
     # needed.
-    if (%recordAttrs) {
-        foreach my $x ( keys %recordAttrs ){
-            $recAttrs{ $x } = $recordAttrs{ $x };
+    if ($recordAttrs) {
+        foreach my $x ( keys %{$recordAttrs} ){
+            $recAttrs{ $x } = $recordAttrs->{ $x };
         }
     }
 
@@ -839,7 +838,7 @@ sub add {
 }
 
 sub upsert {
-    my ( $self, $recordType, $recordRef, %recordAttrs ) = @_;
+    my ( $self, $recordType, $recordRef, $recordAttrs ) = @_;
 
     fatal("Invalid recordType: $recordType!")
       if !defined $record_namespaces->{$recordType};
@@ -853,9 +852,9 @@ sub upsert {
     # ExpenseReport supports upserting externalId attr on the <record>
     # element.  recordAttrs argument is optional and passed only when
     # needed.
-    if (%recordAttrs) {
-        foreach my $x ( keys %recordAttrs ){
-            $recAttrs{ $x } = $recordAttrs{ $x };
+    if ($recordAttrs) {
+        foreach my $x ( keys %{$recordAttrs} ){
+            $recAttrs{ $x } = $recordAttrs->{ $x };
         }
     }
 
@@ -883,13 +882,30 @@ sub upsert {
 }
 
 sub update {
-    my ( $self, $recordType, $recordRef ) = @_;
-
-    my $internalId = $recordRef->{internalId};
-    delete $recordRef->{internalId};
+    my ( $self, $recordType, $recordRef, $recordAttrs ) = @_;
 
     $self->error("Invalid recordType: $recordType!")
       if !defined $record_namespaces->{$recordType};
+
+    my %recAttrs = (
+                'xsi:type' => $record_namespaces->{$recordType} . ':'
+                  . ucfirst($recordType)
+    );
+
+    if (defined $recordRef->{internalId}) {
+        $recAttrs{internalId} = $recordRef->{internalId};
+        delete $recordRef->{internalId};
+    }
+
+    # Add recordAttrs to recAttrs.  This supports cases like where
+    # ExpenseReport supports upserting externalId attr on the <record>
+    # element.  recordAttrs argument is optional and passed only when
+    # needed.
+    if ($recordAttrs) {
+        foreach my $x ( keys %{$recordAttrs} ){
+            $recAttrs{ $x } = $recordAttrs->{ $x };
+        }
+    }
 
     $self->soap->on_action( sub { return 'update'; } );
     my $som = $self->soap->update(
@@ -898,13 +914,7 @@ sub update {
             'record' => \SOAP::Data->value(
                 $self->_parseRequest( ucfirst($recordType), $recordRef )
             )
-          )->attr(
-            {
-                'xsi:type' => $record_namespaces->{$recordType} . ':'
-                  . ucfirst($recordType),
-                'internalId' => $internalId
-            }
-          )
+          )->attr(\%recAttrs)
     );
 
     if ( $som->fault ) {
@@ -924,8 +934,8 @@ sub update {
     }
 }
 
-sub attach {
-    my ( $self, $attachRequest ) = @_;
+sub attachOrDetach {
+    my ( $self, $operation, $attachRequest ) = @_;
 
     # example usage:
     #    sub nsRecRef {
@@ -954,7 +964,7 @@ sub attach {
     # Only AttachBasicReference is supported at this time.
 
 
-    $self->soap->on_action( sub { return 'attach'; } );
+    $self->soap->on_action( sub { return $operation; } );
     my $attachTo = SOAP::Data->name('attachTo')->attr( {
                 internalId => $attachRequest->{attachTo}->{internalId},
                 type       => $attachRequest->{attachTo}->{type},
@@ -973,16 +983,18 @@ sub attach {
                 'attachReferece' => \SOAP::Data->value(
                     $attachTo,
                     $attachedRecord
-                ))->attr({'xsi:type' => namespace('core') . ':AttachBasicReference'})
+                ))->attr({'xsi:type' => namespace('core')
+                         . ':AttachBasicReference'})
     );
 
     if ( $som->fault ) {
         $self->error;
     } else {
-        if ( $som->match("//attachResponse/writeResponse/status") ) {
-            if ( $som->dataof("//attachResponse/writeResponse/status")
+        my $responseNode = $operation."Response";
+        if ( $som->match("//$responseNode/writeResponse/status") ) {
+            if ( $som->dataof("//$responseNode/writeResponse/status")
                 ->attr->{'isSuccess'} eq 'true' ) {
-                return $som->dataof("//attachResponse/writeResponse/baseRef")
+                return $som->dataof("//$responseNode/writeResponse/baseRef")
                   ->attr->{'internalId'};
             } else {
                 $self->error;
@@ -991,6 +1003,16 @@ sub attach {
             $self->error;
         }
     }
+}
+
+sub attach {
+    my ( $self, $attachRequest ) = @_;
+    return $self->attachOrDetach('attach', $attachRequest);
+}
+
+sub detach {
+    my ( $self, $attachRequest ) = @_;
+    return $self->attachOrDetach('attach', $attachRequest);
 }
 
 sub error {
@@ -1029,6 +1051,16 @@ sub _parseRequest {
             my $listElementName = $key;
             $listElementName =~ s/^(.*)List$/$1/;
 
+            my $ltype = $record_fields->{$requestType}->{$key};
+            $ltype =~ s/.*://;
+            #print "DEBUG: requestType=$requestType, key=$key, ltype=$ltype\n";
+            if (defined $record_fields->{$ltype}) {
+                my @ftypes = keys $record_fields->{$ltype};
+                if (scalar @ftypes == 1) {
+                    #print "DEBUG: ftype for $key is $ftype\n";
+                    $listElementName = $ftypes[0];
+                }
+            }
             my @listElements;
             for my $listElement ( @{ $requestRef->{$key} } ) {
                 my @sequence;
@@ -1042,6 +1074,9 @@ sub _parseRequest {
 
                     $element->{attr}->{internalId} =
                       $listElement->{internalId};
+
+                    $element->{attr}->{scriptId} =
+                      $listElement->{scriptId};
 
                     $element->{attr}->{'xsi:type'} =
                       $listElement->{type};
@@ -1090,6 +1125,7 @@ sub _parseRequestField {
         if (ref($value) eq "HASH") {
             my %v = %{$value};
             $element->{attr}->{internalId} = $v{internalId};
+            $element->{attr}->{externalId} = $v{externalId};
             $element->{attr}->{type} = $v{type};
         } else {
             $element->{attr}->{internalId} = $value;
@@ -1517,13 +1553,22 @@ updated must be present inside the hash reference.
 If successful this method will return the internalId of the updated record
 Otherwise, the error details are sent to the errorResults method.
 
-=head2 delete(recordType, internalId)
+=head2 delete(recordType, hashOrInternalId)
 
 The delete method very simply deletes a record.  It requires the record type
-and internalId number for the record.
+and either a hashref indicating the criteria or internalId number for the
+record.
 
-    my $internalId = $ns->delete('customer', 1234);
-    print "I have deleted a customer with internalId $internalId\n";
+    The first 2 examples are exactly the same:
+
+    1) my $internalId = $ns->delete('customer', 1234);
+       print "I have deleted a customer with internalId $internalId\n";
+
+    2) my $internalId = $ns->delete('customer', {internalId => 1234});
+       print "I have deleted a customer with internalId $internalId\n";
+
+    3) my $internalId = $ns->delete('customer', {externalId => 5678});
+       print "I have deleted a customer with internalId $internalId\n";
 
 If successful this method will return the internalId of the deleted record
 Otherwise, the error details are sent to the errorResults method.
@@ -1779,9 +1824,18 @@ limit of an initial search).
         }
     }
 
-=head2 get(recordType, internalId)
+=head2 get(recordType, hashOrInternalId)
 
-The get method returns the most complete information for a record.
+The get method returns the most complete information for a record. It takes
+a hash which describes the criteria or an internalId.
+
+The first 2 examples are identical:
+
+1) $ns->get('customer', 1234)
+
+2) $ns->get('customer', {internalId => 1234})
+
+3) $ns->get('customer', {externalId => 5678})
 
     # to see an individual field in the response
     if ($ns->get('customer', 1234)) {
@@ -2034,6 +2088,27 @@ coreTypes XSD file for web services version 2.6.
 Look for the "RecordType" simpleType.
 
 L<https://webservices.netsuite.com/xsd/platform/v2_6_0/coreTypes.xsd>
+
+=head2 attach(attachRequest)
+=head2 detach(detachRequest)
+
+At this time, only a basic reference is supported, Contact reference is not
+supported yet.
+
+As an example, to attach a file to an expenseReport, you would do the following:
+
+    sub nsRecRef {
+        my ($rectype, $id) = @_;
+        return  { type => $rectype, internalId => $id };
+    }
+ 
+    my $attachRequest = {
+        attachTo        => nsRecRef('expenseReport', $erId),
+        attachedRecord  => nsRecRef('file',          $fid)
+    };
+    $ns->attach($attachRequest) or nsfatal 'error attaching';
+
+    The detach operation is coded exactly the same.
 
 =head2 errorResults
 

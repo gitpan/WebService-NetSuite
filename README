@@ -6,12 +6,20 @@ SYNOPSIS
         use WebService::NetSuite;
   
         my $ns = WebService::NetSuite->new({
-            nsrole     => 3,
-            nsemail    => 'blarg@foo.com',
-            nspassword => 'foobar123',
-            nsaccount  => 123456,
-            sandbox    => 1,
+            nsemail         => 'blarg@foo.com',
+            nspassword      => 'foobar123',
+            nsroleName      => 'Administrator',
+            nsaccountName   => 'My NS Account',
         });
+
+        # old 'new' method still supported, but discouraged:
+        #my $ns = WebService::NetSuite->new({
+        #    nsrole     => 3,
+        #    nsemail    => 'blarg@foo.com',
+        #    nspassword => 'foobar123',
+        #    nsaccount  => 123456,
+        #    sandbox    => 1,
+        #});
 
         my $customer_id = $ns->add( 'customer',
             { firstName  => 'Gonzo',
@@ -40,6 +48,36 @@ DESCRIPTION
 
     You'll need a NetSuite login to get to the help center unfortunately.
     Silly NetSuite.
+
+  new(%options)
+    The new method creates the WebService::NetSuite object and the
+    underlying SOAP object that is used to communicate with NetSuite. The
+    new symtax automatically determines the NetSuite host to communicate
+    with based on your email, password, and account name:
+
+        NEW SYNTAX:
+
+        my $ns = WebService::NetSuite->new({
+            nsemail         => 'blarg@foo.com',
+            nspassword      => 'foobar123',
+            nsroleName      => 'Administrator',
+            nsaccountName   => 'My NS Account',
+            sandbox         => 0,
+            debug           => 1,
+            debugFile       => 'NetSuite.dbg',
+        });
+
+        OLD SYNTAX:
+
+        my $ns = WebService::NetSuite->new({
+            nsrole          => 3,
+            nsemail         => 'blarg@foo.com',
+            nspassword      => 'foobar123',
+            nsaccount       => 123456,
+            sandbox         => 0,
+            debug           => 1,
+            debugFile       => 'NetSuite.dbg',
+        });
 
   add(recordType, hashReference)
     The add method submits a new record to NetSuite. It requires a record
@@ -113,12 +151,21 @@ DESCRIPTION
     If successful this method will return the internalId of the updated
     record Otherwise, the error details are sent to the errorResults method.
 
-  delete(recordType, internalId)
+  delete(recordType, hashOrInternalId)
     The delete method very simply deletes a record. It requires the record
-    type and internalId number for the record.
+    type and either a hashref indicating the criteria or internalId number
+    for the record.
 
-        my $internalId = $ns->delete('customer', 1234);
-        print "I have deleted a customer with internalId $internalId\n";
+        The first 2 examples are exactly the same:
+
+        1) my $internalId = $ns->delete('customer', 1234);
+           print "I have deleted a customer with internalId $internalId\n";
+
+        2) my $internalId = $ns->delete('customer', {internalId => 1234});
+           print "I have deleted a customer with internalId $internalId\n";
+
+        3) my $internalId = $ns->delete('customer', {externalId => 5678});
+           print "I have deleted a customer with internalId $internalId\n";
 
     If successful this method will return the internalId of the deleted
     record Otherwise, the error details are sent to the errorResults method.
@@ -220,7 +267,7 @@ DESCRIPTION
                             attr => {
                                 internalId => 'custentity1',
                                 operator => 'anyOf',
-                                'xsi:type' => 'core:SearchMultiSelectCustomField'
+                                'xsi:type' => namespace('core') . ':SearchMultiSelectCustomField'
                             },
                             value => [
                                 { attr => { internalId => 1 } },
@@ -366,8 +413,17 @@ DESCRIPTION
             }
         }
 
-  get(recordType, internalId)
-    The get method returns the most complete information for a record.
+  get(recordType, hashOrInternalId)
+    The get method returns the most complete information for a record. It
+    takes a hash which describes the criteria or an internalId.
+
+    The first 2 examples are identical:
+
+    1) $ns->get('customer', 1234)
+
+    2) $ns->get('customer', {internalId => 1234})
+
+    3) $ns->get('customer', {externalId => 5678})
 
         # to see an individual field in the response
         if ($ns->get('customer', 1234)) {
@@ -620,6 +676,27 @@ DESCRIPTION
     "RecordType" simpleType.
 
     <https://webservices.netsuite.com/xsd/platform/v2_6_0/coreTypes.xsd>
+
+  attach(attachRequest)
+=head2 detach(detachRequest)
+    At this time, only a basic reference is supported, Contact reference is
+    not supported yet.
+
+    As an example, to attach a file to an expenseReport, you would do the
+    following:
+
+        sub nsRecRef {
+            my ($rectype, $id) = @_;
+            return  { type => $rectype, internalId => $id };
+        }
+ 
+        my $attachRequest = {
+            attachTo        => nsRecRef('expenseReport', $erId),
+            attachedRecord  => nsRecRef('file',          $fid)
+        };
+        $ns->attach($attachRequest) or nsfatal 'error attaching';
+
+        The detach operation is coded exactly the same.
 
   errorResults
     The errorResults method is populated when a request returns an erroneous
